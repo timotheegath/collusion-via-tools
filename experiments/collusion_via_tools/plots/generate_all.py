@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import List, Optional, Set
+from typing import List, Optional, Set, Tuple
 
 from experiments.common.plotting.io_utils import (
     ensure_dir,
@@ -85,9 +85,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     sweep_group = parser.add_mutually_exclusive_group(required=True)
     sweep_group.add_argument(
         "--sweep-dir",
+        action="append",
         type=str,
         default=None,
-        help="Path like experiments/collusion_via_tools/outputs/<tag>/<ts>/runs/<model>/<sweep_name>",
+        help=(
+            "Path like experiments/collusion_via_tools/outputs/<tag>/<ts>/runs/<model>/<sweep_name>. "
+            "Pass multiple times to combine several sweeps into a single plot run "
+            "(rows from all sweeps are merged and plotted together)."
+        ),
     )
     sweep_group.add_argument(
         "--model-runs-dir",
@@ -144,18 +149,37 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.model_runs_dir:
         model_dir = Path(args.model_runs_dir).expanduser().resolve()
         sweep_dir = model_dir / str(args.sweep_name)
+        sweep_dirs: List[Path] = [sweep_dir]
         # If caller didn't explicitly pass a benign dir, infer it as a sibling sweep under model_dir.
         if not args.benign_sweep_dir:
             inferred_benign = model_dir / str(args.benign_sweep_name)
             if inferred_benign.exists():
                 args.benign_sweep_dir = str(inferred_benign)
     else:
-        sweep_dir = Path(args.sweep_dir).expanduser().resolve()
+        sweep_dirs = [Path(p).expanduser().resolve() for p in (args.sweep_dir or [])]
 
-    if not sweep_dir.exists():
-        raise FileNotFoundError(f"sweep_dir does not exist: {sweep_dir}")
-    runs, meta = load_runs(sweep_dir)
-    tables = build_tables(runs)
+    for sd in sweep_dirs:
+        if not sd.exists():
+            raise FileNotFoundError(f"sweep_dir does not exist: {sd}")
+
+    # Load and merge all sweep dirs. Dedupe by run_id so re-listing the same
+    # sweep (or two sweeps that share a run_id) doesn't double-count rows.
+    all_runs: List = []
+    sources: List[Tuple[Path, dict, int]] = []
+    seen_run_ids: Set[str] = set()
+    for sd in sweep_dirs:
+        runs, meta = load_runs(sd)
+        kept = 0
+        for r in runs:
+            rid = str(getattr(r, "run_id", "") or r.run_dir.name)
+            if rid in seen_run_ids:
+                continue
+            seen_run_ids.add(rid)
+            all_runs.append(r)
+            kept += 1
+        sources.append((sd, meta, kept))
+    tables = build_tables(all_runs)
+    meta = sources[-1][1] if sources else {}
 
     seed_filter = _parse_seeds_spec(args.seeds) if args.seeds else None
     if seed_filter:
@@ -178,16 +202,28 @@ def main(argv: Optional[List[str]] = None) -> int:
                 agent_rows=_filter_rows_by_seeds(benign_tables.agent_rows, seed_filter),
             )
 
-    labels = infer_labels_from_sweep_dir(sweep_dir)
-    out_dir = (
-        Path(args.out_dir).expanduser().resolve()
-        if args.out_dir
-        else Path("experiments/collusion_via_tools/plots_outputs")
-        / labels.experiment_tag
-        / labels.timestamp
-        / labels.model_label
-        / labels.sweep_name
-    )
+    if args.out_dir:
+        out_dir = Path(args.out_dir).expanduser().resolve()
+    else:
+        labels = infer_labels_from_sweep_dir(sweep_dirs[0])
+        if len(sweep_dirs) == 1:
+            out_dir = (
+                Path("experiments/collusion_via_tools/plots_outputs")
+                / labels.experiment_tag
+                / labels.timestamp
+                / labels.model_label
+                / labels.sweep_name
+            )
+        else:
+            # Combined sweeps: keep the timestamp from the first source and
+            # stash everything under a single "combined" subdir so the
+            # cross-sweep CSVs and plots land in one place.
+            out_dir = (
+                Path("experiments/collusion_via_tools/plots_outputs")
+                / labels.experiment_tag
+                / labels.timestamp
+                / "combined"
+            )
     ensure_dir(out_dir)
 
     # Diagnostics: detect mismatches between requested sweep params (from run_id)
@@ -233,10 +269,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         out_dir / "meta.json",
         {
             "meta": meta,
+            "sources": [
+                {"sweep_dir": str(sd), "n_runs": kept, "meta": m}
+                for sd, m, kept in sources
+            ],
             "benign_meta": benign_meta,
             "mismatches": mismatch_counts,
             "counts": {
-                "runs": len(runs),
+                "runs": len(all_runs),
                 "run_rows": len(tables.run_rows),
                 "agent_rows": len(tables.agent_rows),
                 "benign_runs": len(benign_tables.run_rows) if benign_tables else 0,
