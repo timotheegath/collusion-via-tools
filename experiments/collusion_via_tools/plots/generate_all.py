@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from experiments.common.plotting.io_utils import (
     ensure_dir,
@@ -76,6 +76,59 @@ def _filter_rows_by_int(rows: List[dict], key: str, value: int) -> List[dict]:
 
 def _filter_rows_by_str(rows: List[dict], key: str, value: str) -> List[dict]:
     return [r for r in rows if str(r.get(key)) == str(value)]
+
+
+def _compute_series_labels(
+    sweep_dirs: List[Path],
+    metas: List[dict],
+    fallback_model_labels: List[Optional[str]],
+) -> List[str]:
+    """
+    Build a unique, human-readable legend label per source sweep.
+
+    Default label is the sweep dir basename. When several selected sweeps share
+    the same basename (their legend entries would be indistinguishable), every
+    colliding sweep is prefixed with its model label, e.g.
+    ``glm5.3-flash/baseline_sweep``. Any remaining collisions (same basename
+    *and* same model label) get a numeric suffix (`` (2)``, `` (3)``, ...) so
+    the returned list is guaranteed to be unique.
+    """
+    basenames = [sd.name for sd in sweep_dirs]
+    basename_counts: Dict[str, int] = {}
+    for b in basenames:
+        basename_counts[b] = basename_counts.get(b, 0) + 1
+
+    model_labels: List[str] = []
+    for i, meta in enumerate(metas):
+        label = str((meta or {}).get("model_label") or "").strip()
+        if not label:
+            label = str(fallback_model_labels[i] or "").strip()
+        model_labels.append(label)
+
+    labels: List[str] = []
+    for basename, model_label in zip(basenames, model_labels):
+        if basename_counts.get(basename, 0) > 1 and model_label:
+            labels.append(f"{model_label}/{basename}")
+        else:
+            labels.append(basename)
+
+    seen: Dict[str, int] = {}
+    unique: List[str] = []
+    for label in labels:
+        n = seen.get(label, 0) + 1
+        seen[label] = n
+        unique.append(label if n == 1 else f"{label} ({n})")
+    return unique
+
+
+def _tag_rows_with_series(
+    rows: List[dict], run_dir_to_series: Dict[str, Tuple[int, str]]
+) -> None:
+    """Add ``series_index`` / ``series_label`` columns to each row in-place."""
+    for row in rows:
+        idx, label = run_dir_to_series.get(str(row.get("run_dir")), (0, "Main sweep"))
+        row["series_index"] = idx
+        row["series_label"] = label
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -167,19 +220,51 @@ def main(argv: Optional[List[str]] = None) -> int:
     all_runs: List = []
     sources: List[Tuple[Path, dict, int]] = []
     seen_run_ids: Set[str] = set()
-    for sd in sweep_dirs:
+    run_dir_to_series_index: Dict[str, int] = {}
+    series_run_dirs: List[Set[str]] = []
+    for series_index, sd in enumerate(sweep_dirs):
         runs, meta = load_runs(sd)
         kept = 0
+        kept_dirs: Set[str] = set()
         for r in runs:
             rid = str(getattr(r, "run_id", "") or r.run_dir.name)
             if rid in seen_run_ids:
                 continue
             seen_run_ids.add(rid)
             all_runs.append(r)
+            run_dir_to_series_index[str(r.run_dir)] = series_index
+            kept_dirs.add(str(r.run_dir))
             kept += 1
+        series_run_dirs.append(kept_dirs)
         sources.append((sd, meta, kept))
     tables = build_tables(all_runs)
     meta = sources[-1][1] if sources else {}
+
+    # Series tagging: map each run dir to the sweep it was loaded from so rows
+    # from different source sweeps can be plotted as distinguishable series.
+    model_label_by_run_dir: Dict[str, Optional[str]] = {}
+    for row in tables.run_rows:
+        rd = str(row.get("run_dir"))
+        if rd not in model_label_by_run_dir:
+            model_label_by_run_dir[rd] = row.get("model_label")
+    fallback_model_labels: List[Optional[str]] = []
+    for kept_dirs in series_run_dirs:
+        fallback: Optional[str] = None
+        for rd in sorted(kept_dirs):
+            candidate = model_label_by_run_dir.get(rd)
+            if candidate:
+                fallback = str(candidate)
+                break
+        fallback_model_labels.append(fallback)
+
+    series_labels = _compute_series_labels(
+        sweep_dirs, [m for _, m, _ in sources], fallback_model_labels
+    )
+    run_dir_to_series: Dict[str, Tuple[int, str]] = {
+        rd: (idx, series_labels[idx]) for rd, idx in run_dir_to_series_index.items()
+    }
+    _tag_rows_with_series(tables.run_rows, run_dir_to_series)
+    _tag_rows_with_series(tables.agent_rows, run_dir_to_series)
 
     seed_filter = _parse_seeds_spec(args.seeds) if args.seeds else None
     if seed_filter:
@@ -270,8 +355,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         {
             "meta": meta,
             "sources": [
-                {"sweep_dir": str(sd), "n_runs": kept, "meta": m}
-                for sd, m, kept in sources
+                {
+                    "sweep_dir": str(sd),
+                    "n_runs": kept,
+                    "meta": m,
+                    "series_index": idx,
+                    "series_label": series_labels[idx],
+                }
+                for idx, (sd, m, kept) in enumerate(sources)
             ],
             "benign_meta": benign_meta,
             "mismatches": mismatch_counts,

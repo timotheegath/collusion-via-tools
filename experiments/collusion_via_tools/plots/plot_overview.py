@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +26,15 @@ logger = logging.getLogger(__name__)
 
 _ADVERSARY_BAR_COLOR = "#4c78a8"
 _BENIGN_BAR_COLOR = "#f58518"
+_SERIES_COLORS = (
+    "#4c78a8",
+    "#009e73",
+    "#7570b3",
+    "#56b4e9",
+    "#666666",
+    "#332288",
+)
+_SERIES_MARKERS = ("o", "^", "D", "v", "P", "X", "<", ">", "h", "H")
 
 _STYLE = {
     "font.size": 24,
@@ -33,6 +43,72 @@ _STYLE = {
     "ytick.labelsize": 24,
     "legend.fontsize": 24,
 }
+
+
+def _series_style(series_index: int) -> Tuple[str, str]:
+    i = int(series_index)
+    return (
+        _SERIES_COLORS[i % len(_SERIES_COLORS)],
+        _SERIES_MARKERS[i % len(_SERIES_MARKERS)],
+    )
+
+
+def _series_groups(
+    rows: List[Dict[str, Any]],
+) -> List[Tuple[int, str, List[Dict[str, Any]]]]:
+    grouped: Dict[int, List[Dict[str, Any]]] = {}
+    labels: Dict[int, str] = {}
+    for row in rows:
+        raw_index = row.get("series_index")
+        try:
+            index = int(raw_index) if raw_index not in (None, "") else 0
+        except (TypeError, ValueError):
+            index = 0
+        grouped.setdefault(index, []).append(row)
+        label = str(row.get("series_label") or "").strip()
+        if label and index not in labels:
+            labels[index] = label
+    multi = len(grouped) > 1
+    return [
+        (
+            index,
+            labels.get(index) or ("Main sweep" if not multi else f"Series {index + 1}"),
+            grouped[index],
+        )
+        for index in sorted(grouped)
+    ]
+
+
+def _multi_legend(ax: Any, n_entries: int, *, fontsize: float = 12.0) -> None:
+    ax.legend(
+        loc="lower center",
+        bbox_to_anchor=(0.5, 1.01),
+        ncol=min(2, max(1, n_entries)),
+        fontsize=fontsize,
+        frameon=False,
+        handlelength=1.5,
+        columnspacing=1.2,
+        borderaxespad=0.2,
+    )
+
+
+def _adv_counts_for_plot(
+    main: List[Dict[str, Any]],
+    base: List[Dict[str, Any]],
+    adv_counts: Sequence[int],
+    *,
+    multi: bool,
+) -> List[int]:
+    if not multi:
+        return sorted({int(a) for a in adv_counts})
+    counts = {
+        count
+        for count in (_as_int(r.get("adversary_count")) for r in main)
+        if count is not None
+    }
+    if base:
+        counts.add(0)
+    return sorted(counts)
 
 
 def _as_int(value: Any) -> Optional[int]:
@@ -135,187 +211,298 @@ def _bar_by_adversary_count(
     out_path: Path,
     emit_artifacts: bool = True,
 ) -> None:
-    """
-    Single-series bar plot: one bar per adversary count value present.
-
-    adversary_count == 0 is the benign baseline bar; when the main rows carry no
-    adversary_count == 0 runs, the separately-run benign sweep (benign_rows) is
-    overlaid in its place.
-    """
+    """Plot one pooled bar per count, or grouped bars in multi-series mode."""
     apply_default_style(plt)
     plt.rcParams.update(_STYLE)
     ensure_dir(out_path.parent)
-
     main = _filter_rows(run_rows, num_agents=num_agents, target_role=target_role)
     base = _filter_rows(benign_rows, num_agents=num_agents, target_role=target_role)
-
-    xs: List[int] = []
-    heights: List[float] = []
-    yerrs: List[float] = []
-    labels: List[str] = []
-    bar_colors: List[str] = []
-
+    series = _series_groups(main)
+    multi = len(series) > 1
+    single_index, single_label = series[0][:2] if series else (0, "Main sweep")
+    # plot_overview computes the multi-series union and requests one chart per
+    # non-zero count; keep each such chart scoped to its own count plus benign.
+    counts = sorted({int(a) for a in adv_counts})
+    bars: List[Dict[str, Any]] = []
     artifact_rows: List[Dict[str, Any]] = []
+    series_catalog = json.dumps([[index, label] for index, label, _ in series])
 
-    for ac in sorted({int(a) for a in adv_counts}):
-        rows_for_ac = _rows_for_adversary_count(main, base, int(ac))
+    for ac in counts:
+        if not multi:
+            candidates = [
+                (
+                    _rows_for_adversary_count(main, base, int(ac)),
+                    _bar_color(int(ac)),
+                    "s" if int(ac) == 0 else "o",
+                    "Benign baseline" if int(ac) == 0 else single_label,
+                    None if int(ac) == 0 else single_index,
+                )
+            ]
+            width = 0.8
+        else:
+            candidates = [
+                (
+                    _filter_adv_count(selected, int(ac)),
+                    _series_style(index)[0],
+                    _series_style(index)[1],
+                    label,
+                    index,
+                )
+                for index, label, selected in series
+            ]
+            if int(ac) == 0 and base:
+                candidates.append(
+                    (
+                        _filter_adv_count(base, 0),
+                        _BENIGN_BAR_COLOR,
+                        "s",
+                        "Benign baseline",
+                        None,
+                    )
+                )
+            width = 0.8 / len(candidates)
 
-        # Artifact: raw points used for this bar.
-        for r in rows_for_ac:
-            v = r.get(metric_key)
-            if v is None:
+        for candidate_i, (selected, color, marker, label, index) in enumerate(
+            candidates
+        ):
+            if not selected:
                 continue
-            artifact_rows.append(
+            m, e, _ = _aggregate_metric(
+                selected,
+                metric_key=metric_key,
+                default_when_missing=_default_when_missing(metric_key, int(ac)),
+            )
+            if m is None:
+                continue
+            offset = (
+                (candidate_i - (len(candidates) - 1) / 2.0) * width if multi else 0.0
+            )
+            bars.append(
                 {
-                    "plot_type": "bar_by_adversary_count",
-                    "plot_metric_key": metric_key,
-                    "plot_metric_label": metric_label,
-                    "num_agents": num_agents,
-                    "target_role": target_role,
-                    "adversary_count": int(ac),
-                    "group": "benign" if int(ac) == 0 else "main",
-                    "value": v,
-                    "run_id": r.get("run_id"),
-                    "seed": r.get("seed"),
+                    "ac": int(ac),
+                    "x": float(ac) + offset,
+                    "height": float(m),
+                    "error": float(e or 0.0),
+                    "color": color,
+                    "label": label,
+                    "group": "baseline" if index is None else "main",
+                    "width": width if multi else 0.8,
                 }
             )
-
-        m, e, n = _aggregate_metric(
-            rows_for_ac,
-            metric_key=metric_key,
-            default_when_missing=_default_when_missing(metric_key, int(ac)),
-        )
-        if m is None:
-            continue
-        xs.append(int(ac))
-        heights.append(float(m))
-        yerrs.append(float(e or 0.0))
-        labels.append(_adv_label(int(ac)))
-        bar_colors.append(_bar_color(int(ac)))
-
-    if not xs:
+            default = _default_when_missing(metric_key, int(ac))
+            for row in selected:
+                value = row.get(metric_key)
+                if value is None:
+                    if default is None:
+                        continue
+                    value = float(default)
+                artifact_rows.append(
+                    {
+                        "plot_type": "bar_by_adversary_count",
+                        "plot_metric_key": metric_key,
+                        "plot_metric_label": metric_label,
+                        "num_agents": num_agents,
+                        "target_role": target_role,
+                        "adversary_count": int(ac),
+                        "group": "baseline" if index is None else "main",
+                        "series_index": "" if index is None else index,
+                        "series_label": label,
+                        "plot_series_json": series_catalog,
+                        "value": value,
+                        "run_id": row.get("run_id"),
+                        "seed": row.get("seed"),
+                    }
+                )
+    if not bars:
         return
 
     fig, ax = plt.subplots(figsize=(9.2, 4.4))
     ax.grid(False)
-    ax.bar(xs, heights, yerr=yerrs, capsize=3, color=bar_colors, alpha=0.9)
-    # Make zero-height bars visible (e.g., benign regret is exactly 0).
-    for x, h, c in zip(xs, heights, bar_colors):
-        if abs(float(h)) < 1e-12:
-            ax.plot([x], [0.0], marker="_", markersize=18, color=c, zorder=6)
-    ax.set_xticks(xs)
-    ax.set_xticklabels(labels, rotation=0, ha="center")
+    if not multi:
+        ax.bar(
+            [int(b["ac"]) for b in bars],
+            [float(b["height"]) for b in bars],
+            yerr=[float(b["error"]) for b in bars],
+            capsize=3,
+            color=[str(b["color"]) for b in bars],
+            alpha=0.9,
+        )
+    else:
+        for b in bars:
+            x = float(b["x"])
+            color = str(b["color"])
+            ax.bar(
+                [x],
+                [float(b["height"])],
+                yerr=[float(b["error"])],
+                width=float(b["width"]),
+                capsize=3,
+                color=color,
+                alpha=0.9,
+            )
+            label = str(b.get("label") or "")
+            raw_values = finite(
+                [
+                    r["value"]
+                    for r in artifact_rows
+                    if int(r["adversary_count"]) == int(b["ac"])
+                    and str(r.get("group")) == str(b["group"])
+                    and (
+                        b["group"] == "baseline" or str(r.get("series_label")) == label
+                    )
+                ]
+            )
+            ax.scatter([x] * len(raw_values), raw_values, s=16, alpha=0.25, color=color)
+        for index, label, _ in series:
+            color, marker = _series_style(index)
+            ax.scatter([], [], s=38, color=color, marker=marker, label=label)
+        has_baseline = any(b["group"] == "baseline" for b in bars)
+        if has_baseline:
+            ax.scatter(
+                [],
+                [],
+                s=34,
+                color=_BENIGN_BAR_COLOR,
+                marker="s",
+                label="Benign baseline",
+            )
+        _multi_legend(ax, len(series) + int(has_baseline))
+
+    for b in bars:
+        if abs(float(b["height"])) < 1e-12:
+            ax.plot(
+                [float(b["x"])],
+                [0.0],
+                marker="_",
+                markersize=18,
+                color=str(b["color"]),
+                zorder=6,
+            )
+    present = sorted({int(b["ac"]) for b in bars})
+    ax.set_xticks(present)
+    ax.set_xticklabels([_adv_label(ac) for ac in present], rotation=0, ha="center")
     ax.set_xlabel("Adversary Count")
     ax.set_ylabel(metric_label)
-
     fig.tight_layout()
     fig.savefig(out_path, format="pdf", bbox_inches="tight")
     log_saved_plot(out_path, logger=logger)
     plt.close(fig)
-
     if not emit_artifacts:
         return
 
     csv_path = out_path.with_suffix(".csv")
     script_path = out_path.with_name(out_path.stem + "__replot.py")
     write_csv(csv_path, artifact_rows)
-
     script = f"""\
 from __future__ import annotations
-
 import csv
+import json
 import math
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-
+from typing import Any, Dict, List, Optional, Tuple
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+_COLORS = ("#4c78a8", "#009e73", "#7570b3", "#56b4e9", "#666666", "#332288")
+_MARKERS = ("o", "^", "D", "v", "P", "X", "<", ">", "h", "H")
 
-def _as_float(x: Any) -> Optional[float]:
+def _float(x: Any) -> Optional[float]:
     try:
         return float(x)
     except Exception:
         return None
 
+def _finite(xs: List[Any]) -> List[float]:
+    return [f for f in (_float(x) for x in xs) if f is not None and math.isfinite(f)]
 
-def _mean(xs: List[float]) -> Optional[float]:
-    if not xs:
-        return None
+def _mean(xs: List[float]) -> float:
     return float(sum(xs) / len(xs))
-
 
 def _sem(xs: List[float]) -> float:
     if len(xs) <= 1:
         return 0.0
-    m = float(sum(xs) / len(xs))
-    var = sum((x - m) ** 2 for x in xs) / float(len(xs) - 1)
-    return float(math.sqrt(var) / math.sqrt(len(xs)))
+    m = _mean(xs)
+    return math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1)) / math.sqrt(len(xs))
 
-
-def _finite(xs: List[Any]) -> List[float]:
-    out: List[float] = []
-    for x in xs:
-        f = _as_float(x)
-        if f is None:
-            continue
-        if math.isfinite(f):
-            out.append(float(f))
-    return out
-
+def _series(rows: List[Dict[str, Any]]) -> List[Tuple[int, str, List[Dict[str, Any]]]]:
+    grouped: Dict[int, List[Dict[str, Any]]] = {{}}
+    labels: Dict[int, str] = {{}}
+    for row in rows:
+        try:
+            index = int(row.get("series_index") or 0)
+        except Exception:
+            index = 0
+        grouped.setdefault(index, []).append(row)
+        label = str(row.get("series_label") or "").strip()
+        if label:
+            labels.setdefault(index, label)
+    multi = len(grouped) > 1
+    return [(i, labels.get(i) or ("Main sweep" if not multi else f"Series {{i + 1}}"), grouped[i]) for i in sorted(grouped)]
 
 def main() -> None:
     here = Path(__file__).resolve().parent
-    csv_path = here / {csv_path.name!r}
-    rows: List[Dict[str, Any]] = []
-    with csv_path.open("r", encoding="utf-8", newline="") as f:
-        for r in csv.DictReader(f):
-            rows.append(dict(r))
+    with (here / {csv_path.name!r}).open("r", encoding="utf-8", newline="") as f:
+        rows = [dict(r) for r in csv.DictReader(f)]
     if not rows:
         raise SystemExit("No rows in CSV")
-
     metric_label = str(rows[0].get("plot_metric_label") or {metric_label!r})
-
+    sweep_rows = [r for r in rows if (r.get("group") or "main") not in ("baseline", "benign")]
+    series = _series(sweep_rows)
+    catalog = json.loads(rows[0].get("plot_series_json") or "[]")
+    if len(catalog) > 1:
+        present = {{index: selected for index, _, selected in series}}
+        series = [(int(index), str(label), present.get(int(index), [])) for index, label in catalog]
+    multi = len(series) > 1
+    advs = sorted({{int(float(r.get("adversary_count") or 0)) for r in rows}})
     fig, ax = plt.subplots(figsize=(9.2, 4.4))
     ax.grid(False)
-
-    xs: List[int] = []
-    heights: List[float] = []
-    yerrs: List[float] = []
-    labels: List[str] = []
-    colors: List[str] = []
-
-    advs = sorted({{int(float(r.get("adversary_count") or 0)) for r in rows}})
-    for ac in advs:
-        vals = _finite(
-            [
-                r.get("value")
-                for r in rows
-                if int(float(r.get("adversary_count") or 0)) == int(ac)
-            ]
-        )
-        if not vals:
-            continue
-        xs.append(int(ac))
-        heights.append(float(_mean(vals) or 0.0))
-        yerrs.append(float(_sem(vals)))
-        labels.append("Benign" if int(ac) == 0 else str(int(ac)))
-        color = "#f58518" if int(ac) == 0 else "#4c78a8"
-        colors.append(color)
-        ax.scatter([float(ac)] * len(vals), vals, s=16, alpha=0.25, color=color)
-
-    ax.bar(xs, heights, yerr=yerrs, capsize=3, color=colors, alpha=0.9)
-    ax.set_xticks(xs)
-    ax.set_xticklabels(labels, rotation=0, ha="center")
+    bars: List[Dict[str, Any]] = []
+    if not multi:
+        for ac in advs:
+            selected = [r for r in rows if int(float(r.get("adversary_count") or 0)) == ac]
+            vals = _finite([r.get("value") for r in selected])
+            if not vals:
+                continue
+            color = "#f58518" if ac == 0 else "#4c78a8"
+            bars.append({{"ac": ac, "x": float(ac), "height": _mean(vals), "color": color}})
+            ax.scatter([float(ac)] * len(vals), vals, s=16, alpha=0.25, color=color)
+        ax.bar([b["x"] for b in bars], [b["height"] for b in bars], yerr=[_sem(_finite([r.get("value") for r in rows if int(float(r.get("adversary_count") or 0)) == b["ac"]])) for b in bars], capsize=3, color=[b["color"] for b in bars], alpha=0.9)
+    else:
+        has_baseline = False
+        for ac in advs:
+            candidates = [(index, label, [r for r in selected if int(float(r.get("adversary_count") or 0)) == ac], _COLORS[index % len(_COLORS)]) for index, label, selected in series]
+            if ac == 0:
+                baseline = [r for r in rows if (r.get("group") or "main") in ("baseline", "benign") and int(float(r.get("adversary_count") or 0)) == 0]
+                if baseline:
+                    candidates.append((None, "Benign baseline", baseline, "#f58518"))
+            width = 0.8 / len(candidates)
+            for ci, (index, label, selected, color) in enumerate(candidates):
+                vals = _finite([r.get("value") for r in selected])
+                if not vals:
+                    continue
+                x = float(ac) + (ci - (len(candidates) - 1) / 2) * width
+                bars.append({{"ac": ac, "x": x, "height": _mean(vals), "color": color}})
+                ax.bar([x], [_mean(vals)], yerr=[_sem(vals)], width=width, capsize=3, color=color, alpha=0.9)
+                ax.scatter([x] * len(vals), vals, s=16, alpha=0.25, color=color)
+                if index is None:
+                    has_baseline = True
+        for index, label, _ in series:
+            ax.scatter([], [], s=38, color=_COLORS[index % len(_COLORS)], marker=_MARKERS[index % len(_MARKERS)], label=label)
+        if has_baseline:
+            ax.scatter([], [], s=34, color="#f58518", marker="s", label="Benign baseline")
+        ax.legend(loc="lower center", bbox_to_anchor=(0.5, 1.01), ncol=min(2, len(series) + int(has_baseline)), fontsize=12, frameon=False, handlelength=1.5, columnspacing=1.2, borderaxespad=0.2)
+    for b in bars:
+        if abs(float(b["height"])) < 1e-12:
+            ax.plot([b["x"]], [0.0], marker="_", markersize=18, color=b["color"], zorder=6)
+    present = sorted({{int(b["ac"]) for b in bars}})
+    ax.set_xticks(present)
+    ax.set_xticklabels(["Benign" if ac == 0 else str(ac) for ac in present], rotation=0, ha="center")
     ax.set_xlabel("Adversary Count")
     ax.set_ylabel(metric_label)
-
     fig.tight_layout()
-    out_pdf = here / {out_path.name!r}
-    fig.savefig(out_pdf, format="pdf", bbox_inches="tight")
+    fig.savefig(here / {out_path.name!r}, format="pdf", bbox_inches="tight")
     plt.close(fig)
-
 
 if __name__ == "__main__":
     main()
@@ -335,77 +522,131 @@ def _lines_over_adversary_count(
     out_path: Path,
     emit_artifacts: bool = True,
 ) -> None:
-    """
-    Line plot: x=adversary_count, a single line over adversary count.
-
-    adversary_count == 0 is the benign baseline point; when the main rows carry
-    no adversary_count == 0 runs, the separately-run benign sweep (benign_rows)
-    is overlaid in its place, so the benign point is kept when available.
-    """
+    """Plot pooled lines, or one line per sweep with a benign reference point."""
     apply_default_style(plt)
     plt.rcParams.update(_STYLE)
     ensure_dir(out_path.parent)
-
     main = _filter_rows(run_rows, num_agents=num_agents, target_role=target_role)
     base = _filter_rows(benign_rows, num_agents=num_agents, target_role=target_role)
-
+    series = _series_groups(main)
+    multi = len(series) > 1
+    series_catalog = json.dumps([[index, label] for index, label, _ in series])
+    counts = _adv_counts_for_plot(main, base, adv_counts, multi=multi)
     fig, ax = plt.subplots(figsize=(7.6, 4.4))
     ax.grid(False)
 
-    xs: List[int] = []
-    ys: List[float] = []
-    es: List[float] = []
-
-    for ac in sorted({int(a) for a in adv_counts}):
-        rows_for_ac = _rows_for_adversary_count(main, base, int(ac))
-        m, e, n = _aggregate_metric(
-            rows_for_ac,
+    if not multi:
+        xs: List[int] = []
+        ys: List[float] = []
+        es: List[float] = []
+        for ac in counts:
+            selected = _rows_for_adversary_count(main, base, int(ac))
+            m, e, _ = _aggregate_metric(
+                selected,
+                metric_key=metric_key,
+                default_when_missing=_default_when_missing(metric_key, int(ac)),
+            )
+            if m is None:
+                continue
+            xs.append(int(ac))
+            ys.append(float(m))
+            es.append(float(e or 0.0))
+        if xs:
+            ax.errorbar(
+                xs,
+                ys,
+                yerr=es,
+                marker="o",
+                linewidth=3.0,
+                markersize=8,
+                elinewidth=2.0,
+                capthick=2.0,
+                capsize=3,
+                color=_ADVERSARY_BAR_COLOR,
+            )
+    else:
+        for index, label, selected in series:
+            xs = []
+            ys = []
+            es = []
+            for ac in counts:
+                if int(ac) == 0:
+                    continue
+                m, e, _ = _aggregate_metric(
+                    _filter_adv_count(selected, int(ac)), metric_key=metric_key
+                )
+                if m is None:
+                    continue
+                xs.append(int(ac))
+                ys.append(float(m))
+                es.append(float(e or 0.0))
+            color, marker = _series_style(index)
+            if xs:
+                ax.errorbar(
+                    xs,
+                    ys,
+                    yerr=es,
+                    marker=marker,
+                    linewidth=2.6,
+                    markersize=8,
+                    elinewidth=2.0,
+                    capthick=2.0,
+                    capsize=3,
+                    color=color,
+                )
+            ax.scatter([], [], s=40, color=color, marker=marker, label=label)
+        baseline = _rows_for_adversary_count(main, base, 0)
+        m, e, _ = _aggregate_metric(
+            baseline,
             metric_key=metric_key,
-            default_when_missing=_default_when_missing(metric_key, int(ac)),
+            default_when_missing=_default_when_missing(metric_key, 0),
         )
-        if m is None:
-            continue
-        xs.append(int(ac))
-        ys.append(float(m))
-        es.append(float(e or 0.0))
-
-    if xs:
-        ax.errorbar(
-            xs,
-            ys,
-            yerr=es,
-            marker="o",
-            linewidth=3.0,
-            markersize=8,
-            elinewidth=2.0,
-            capthick=2.0,
-            capsize=3,
-            color=_ADVERSARY_BAR_COLOR,
-        )
-
+        has_baseline = m is not None
+        if has_baseline:
+            ax.errorbar(
+                [0],
+                [float(m)],
+                yerr=[float(e or 0.0)],
+                marker="s",
+                linestyle="None",
+                linewidth=2.0,
+                markersize=8,
+                elinewidth=2.0,
+                capthick=2.0,
+                capsize=3,
+                color=_BENIGN_BAR_COLOR,
+            )
+            ax.scatter(
+                [],
+                [],
+                s=36,
+                color=_BENIGN_BAR_COLOR,
+                marker="s",
+                label="Benign baseline",
+            )
+        _multi_legend(ax, len(series) + int(has_baseline))
     ax.set_xlabel("Adversary Count")
     ax.set_ylabel(metric_label)
-    ax.set_xticks(sorted({int(a) for a in adv_counts}))
-
+    ax.set_xticks(counts)
     fig.tight_layout()
     fig.savefig(out_path, format="pdf", bbox_inches="tight")
     log_saved_plot(out_path, logger=logger)
     plt.close(fig)
-
     if not emit_artifacts:
         return
 
-    # Artifact: raw per-run points used for the line plot.
     csv_path = out_path.with_suffix(".csv")
     script_path = out_path.with_name(out_path.stem + "__replot.py")
-
     artifact_rows: List[Dict[str, Any]] = []
-    for ac in sorted({int(a) for a in adv_counts}):
-        rows_for_ac = _rows_for_adversary_count(main, base, int(ac))
-        for r in rows_for_ac:
-            v = r.get(metric_key)
-            if v is None:
-                continue
+
+    def _emit(selected: List[Dict[str, Any]], ac: int, index: int, label: str) -> None:
+        default = _default_when_missing(metric_key, int(ac))
+        for row in selected:
+            value = row.get(metric_key)
+            if value is None:
+                if default is None:
+                    continue
+                value = float(default)
             artifact_rows.append(
                 {
                     "plot_type": "lines_over_adversary_count",
@@ -414,117 +655,134 @@ def _lines_over_adversary_count(
                     "num_agents": num_agents,
                     "target_role": target_role,
                     "adversary_count": int(ac),
-                    "group": "benign" if int(ac) == 0 else "main",
-                    "value": v,
-                    "run_id": r.get("run_id"),
-                    "seed": r.get("seed"),
+                    "group": "baseline" if int(ac) == 0 else "main",
+                    "series_index": "" if int(ac) == 0 else index,
+                    "series_label": "Benign baseline" if int(ac) == 0 else label,
+                    "plot_series_json": series_catalog,
+                    "value": value,
+                    "run_id": row.get("run_id"),
+                    "seed": row.get("seed"),
                 }
             )
 
+    if not multi:
+        index, label = series[0][:2] if series else (0, "Main sweep")
+        for ac in counts:
+            _emit(_rows_for_adversary_count(main, base, int(ac)), int(ac), index, label)
+    else:
+        for ac in counts:
+            if int(ac) == 0:
+                _emit(_rows_for_adversary_count(main, base, 0), 0, 0, "Benign baseline")
+                continue
+            for index, label, selected in series:
+                _emit(_filter_adv_count(selected, int(ac)), int(ac), index, label)
     write_csv(csv_path, artifact_rows)
-
     script = f"""\
 from __future__ import annotations
-
 import csv
+import json
 import math
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-
+from typing import Any, Dict, List, Optional, Tuple
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+_COLORS = ("#4c78a8", "#009e73", "#7570b3", "#56b4e9", "#666666", "#332288")
+_MARKERS = ("o", "^", "D", "v", "P", "X", "<", ">", "h", "H")
 
-def _as_float(x: Any) -> Optional[float]:
+def _float(x: Any) -> Optional[float]:
     try:
         return float(x)
     except Exception:
         return None
 
+def _finite(xs: List[Any]) -> List[float]:
+    return [f for f in (_float(x) for x in xs) if f is not None and math.isfinite(f)]
 
-def _mean(xs: List[float]) -> Optional[float]:
-    if not xs:
-        return None
+def _mean(xs: List[float]) -> float:
     return float(sum(xs) / len(xs))
-
 
 def _sem(xs: List[float]) -> float:
     if len(xs) <= 1:
         return 0.0
-    m = float(sum(xs) / len(xs))
-    var = sum((x - m) ** 2 for x in xs) / float(len(xs) - 1)
-    return float(math.sqrt(var) / math.sqrt(len(xs)))
+    m = _mean(xs)
+    return math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1)) / math.sqrt(len(xs))
 
-
-def _finite(xs: List[Any]) -> List[float]:
-    out: List[float] = []
-    for x in xs:
-        f = _as_float(x)
-        if f is None:
-            continue
-        if math.isfinite(f):
-            out.append(float(f))
-    return out
-
+def _series(rows: List[Dict[str, Any]]) -> List[Tuple[int, str, List[Dict[str, Any]]]]:
+    grouped: Dict[int, List[Dict[str, Any]]] = {{}}
+    labels: Dict[int, str] = {{}}
+    for row in rows:
+        try:
+            index = int(row.get("series_index") or 0)
+        except Exception:
+            index = 0
+        grouped.setdefault(index, []).append(row)
+        label = str(row.get("series_label") or "").strip()
+        if label:
+            labels.setdefault(index, label)
+    multi = len(grouped) > 1
+    return [(i, labels.get(i) or ("Main sweep" if not multi else f"Series {{i + 1}}"), grouped[i]) for i in sorted(grouped)]
 
 def main() -> None:
     here = Path(__file__).resolve().parent
-    csv_path = here / {csv_path.name!r}
-    rows: List[Dict[str, Any]] = []
-    with csv_path.open("r", encoding="utf-8", newline="") as f:
-        for r in csv.DictReader(f):
-            rows.append(dict(r))
+    with (here / {csv_path.name!r}).open("r", encoding="utf-8", newline="") as f:
+        rows = [dict(r) for r in csv.DictReader(f)]
     if not rows:
         raise SystemExit("No rows in CSV")
-
     metric_label = str(rows[0].get("plot_metric_label") or {metric_label!r})
-
+    sweep_rows = [r for r in rows if (r.get("group") or "main") not in ("baseline", "benign")]
+    series = _series(sweep_rows)
+    catalog = json.loads(rows[0].get("plot_series_json") or "[]")
+    if len(catalog) > 1:
+        present = {{index: selected for index, _, selected in series}}
+        series = [(int(index), str(label), present.get(int(index), [])) for index, label in catalog]
+    multi = len(series) > 1
+    advs = sorted({{int(float(r.get("adversary_count") or 0)) for r in rows}})
     fig, ax = plt.subplots(figsize=(7.6, 4.4))
     ax.grid(False)
-
-    xs: List[int] = []
-    ys: List[float] = []
-    es: List[float] = []
-
-    advs = sorted({{int(float(r.get("adversary_count") or 0)) for r in rows}})
-    for ac in advs:
-        vals = _finite(
-            [
-                r.get("value")
-                for r in rows
-                if int(float(r.get("adversary_count") or 0)) == int(ac)
-            ]
-        )
-        if not vals:
-            continue
-        xs.append(int(ac))
-        ys.append(float(_mean(vals) or 0.0))
-        es.append(float(_sem(vals)))
-
-    if xs:
-        ax.errorbar(
-            xs,
-            ys,
-            yerr=es,
-            marker="o",
-            linewidth=3.0,
-            markersize=8,
-            elinewidth=2.0,
-            capthick=2.0,
-            capsize=3,
-            color="#4c78a8",
-        )
-
+    if not multi:
+        xs: List[int] = []
+        ys: List[float] = []
+        es: List[float] = []
+        for ac in advs:
+            vals = _finite([r.get("value") for r in rows if int(float(r.get("adversary_count") or 0)) == ac])
+            if not vals:
+                continue
+            xs.append(ac)
+            ys.append(_mean(vals))
+            es.append(_sem(vals))
+        if xs:
+            ax.errorbar(xs, ys, yerr=es, marker="o", linewidth=3.0, markersize=8, elinewidth=2.0, capthick=2.0, capsize=3, color="#4c78a8")
+    else:
+        for index, label, selected in series:
+            xs = []
+            ys = []
+            es = []
+            for ac in advs:
+                if ac == 0:
+                    continue
+                vals = _finite([r.get("value") for r in selected if int(float(r.get("adversary_count") or 0)) == ac])
+                if not vals:
+                    continue
+                xs.append(ac)
+                ys.append(_mean(vals))
+                es.append(_sem(vals))
+            color, marker = _COLORS[index % len(_COLORS)], _MARKERS[index % len(_MARKERS)]
+            if xs:
+                ax.errorbar(xs, ys, yerr=es, marker=marker, linewidth=2.6, markersize=8, elinewidth=2.0, capthick=2.0, capsize=3, color=color)
+            ax.scatter([], [], s=40, color=color, marker=marker, label=label)
+        vals = _finite([r.get("value") for r in rows if int(float(r.get("adversary_count") or 0)) == 0])
+        if vals:
+            ax.errorbar([0], [_mean(vals)], yerr=[_sem(vals)], marker="s", linestyle="None", linewidth=2.0, markersize=8, elinewidth=2.0, capthick=2.0, capsize=3, color="#f58518")
+            ax.scatter([], [], s=36, color="#f58518", marker="s", label="Benign baseline")
+        ax.legend(loc="lower center", bbox_to_anchor=(0.5, 1.01), ncol=min(2, len(series) + int(bool(vals))), fontsize=12, frameon=False, handlelength=1.5, columnspacing=1.2, borderaxespad=0.2)
     ax.set_xlabel("Adversary Count")
     ax.set_ylabel(metric_label)
     ax.set_xticks(advs)
-
     fig.tight_layout()
-    out_pdf = here / {out_path.name!r}
-    fig.savefig(out_pdf, format="pdf", bbox_inches="tight")
+    fig.savefig(here / {out_path.name!r}, format="pdf", bbox_inches="tight")
     plt.close(fig)
-
 
 if __name__ == "__main__":
     main()
@@ -577,6 +835,17 @@ def plot_overview(
         for n in num_agents_vals:
             n_dir = role_dir / f"n{int(n)}"
             ensure_dir(n_dir)
+            role_main = _filter_rows(run_rows, num_agents=int(n), target_role=role)
+            role_base = _filter_rows(
+                benign_run_rows, num_agents=int(n), target_role=role
+            )
+            role_series = _series_groups(role_main)
+            adv_counts = _adv_counts_for_plot(
+                role_main,
+                role_base,
+                spec.adv_counts,
+                multi=len(role_series) > 1,
+            )
 
             # Line plots across adversary counts for this role + n.
             _lines_over_adversary_count(
@@ -586,7 +855,7 @@ def plot_overview(
                 metric_label="Joint Reward",
                 num_agents=int(n),
                 target_role=role,
-                adv_counts=spec.adv_counts,
+                adv_counts=adv_counts,
                 out_path=n_dir / "joint_reward_vs_adv_count.pdf",
             )
             _lines_over_adversary_count(
@@ -596,7 +865,7 @@ def plot_overview(
                 metric_label="Coalition Advantage",
                 num_agents=int(n),
                 target_role=role,
-                adv_counts=spec.adv_counts,
+                adv_counts=adv_counts,
                 out_path=n_dir / "coalition_advantage_vs_adv_count.pdf",
             )
             _lines_over_adversary_count(
@@ -606,7 +875,7 @@ def plot_overview(
                 metric_label="Coalition Advantage",
                 num_agents=int(n),
                 target_role=role,
-                adv_counts=spec.adv_counts,
+                adv_counts=adv_counts,
                 out_path=n_dir / "coalition_advantage_hospital_level_vs_adv_count.pdf",
             )
             _lines_over_adversary_count(
@@ -616,7 +885,7 @@ def plot_overview(
                 metric_label="Coalition Advantage",
                 num_agents=int(n),
                 target_role=role,
-                adv_counts=spec.adv_counts,
+                adv_counts=adv_counts,
                 out_path=n_dir
                 / "coalition_advantage_hospital_level_actual_vs_adv_count.pdf",
             )
@@ -627,7 +896,7 @@ def plot_overview(
                 metric_label="Coalition Advantage",
                 num_agents=int(n),
                 target_role=role,
-                adv_counts=spec.adv_counts,
+                adv_counts=adv_counts,
                 out_path=n_dir
                 / "coalition_advantage_hospital_adjusted_vs_adv_count.pdf",
             )
@@ -638,7 +907,7 @@ def plot_overview(
                 metric_label="Coalition Advantage",
                 num_agents=int(n),
                 target_role=role,
-                adv_counts=spec.adv_counts,
+                adv_counts=adv_counts,
                 out_path=n_dir
                 / "coalition_advantage_hospital_adjusted_normalized_vs_adv_count.pdf",
             )
@@ -649,7 +918,7 @@ def plot_overview(
                 metric_label="Coalition Advantage",
                 num_agents=int(n),
                 target_role=role,
-                adv_counts=spec.adv_counts,
+                adv_counts=adv_counts,
                 out_path=n_dir
                 / "coalition_advantage_hospital_level_hospital_adjusted_normalized_vs_adv_count.pdf",
             )
@@ -660,7 +929,7 @@ def plot_overview(
                 metric_label="Overall Regret",
                 num_agents=int(n),
                 target_role=role,
-                adv_counts=spec.adv_counts,
+                adv_counts=adv_counts,
                 out_path=n_dir / "overall_regret_vs_adv_count.pdf",
             )
             _lines_over_adversary_count(
@@ -670,7 +939,7 @@ def plot_overview(
                 metric_label="Coalition Regret",
                 num_agents=int(n),
                 target_role=role,
-                adv_counts=spec.adv_counts,
+                adv_counts=adv_counts,
                 out_path=n_dir / "coalition_regret_vs_adv_count.pdf",
             )
             _lines_over_adversary_count(
@@ -680,7 +949,7 @@ def plot_overview(
                 metric_label="Coalition Regret",
                 num_agents=int(n),
                 target_role=role,
-                adv_counts=spec.adv_counts,
+                adv_counts=adv_counts,
                 out_path=n_dir / "coalition_regret_hospital_adjusted_vs_adv_count.pdf",
             )
             _lines_over_adversary_count(
@@ -690,14 +959,14 @@ def plot_overview(
                 metric_label="Resource Failure Penalty",
                 num_agents=int(n),
                 target_role=role,
-                adv_counts=spec.adv_counts,
+                adv_counts=adv_counts,
                 out_path=n_dir
                 / "resource_failure_penalty_total_agent_attributed_vs_adv_count.pdf",
             )
 
             # Bar plots by adversary count: the benign baseline (adversary_count 0,
             # overlaid from the benign sweep when available) plus the adversary bar.
-            for ac in [a for a in spec.adv_counts if a != 0]:
+            for ac in [a for a in adv_counts if a != 0]:
                 _bar_by_adversary_count(
                     run_rows=run_rows,
                     benign_rows=benign_run_rows,

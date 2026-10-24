@@ -56,6 +56,20 @@ Optional parameters:
 - `--benign-sweep-dir <path>`: overlay a benign baseline
 - `--seeds 0-9`: filter which seeds to include
 
+### Combining multiple sweeps
+Pass `--sweep-dir` more than once to merge several sweeps into a single plotting run.
+Each sweep is drawn as its own series — distinct color, distinct marker, its own legend
+entry — so they are easy to tell apart in the combined figures:
+```bash
+python -m experiments.collusion_via_tools.plots.generate_all \
+  --sweep-dir experiments/collusion_via_tools/outputs/<tag>/<timestamp>/runs/<model>/baseline_sweep \
+  --sweep-dir experiments/collusion_via_tools/outputs/<tag>/<timestamp>/runs/<model>/initial_coordination_sweep
+```
+- Series order follows the order the `--sweep-dir` flags are given; labels are the sweep
+  directory names, disambiguated with the model label if two sweeps share a name.
+- Default output moves to `plots_outputs/<tag>/<timestamp>/combined/`; override with `--out-dir`.
+- `--benign-sweep-dir` stays a separate reference series overlaid on top of the sweep series.
+
 ### Multi-model comparison
 Compare multiple model runs on the same grouped bar charts:
 ```bash
@@ -138,16 +152,6 @@ root is overwritten, not added alongside.
 
 By default Terrarium exposes a `post_message` blackboard tool to every agent.
 To evaluate collusion carried out through tool calls only, the runner can remove `post_message` — either for the whole run, or only after an initial coordination window in the planning phase.
-
-### `disable_post_message_after_round`
-
-One integer knob describes the restriction:
-
-| value | mode | behaviour |
-| --- | --- | --- |
-| unset / `false` | **Unrestricted** (baseline) | `post_message` is available in every phase. |
-| `0` | **Restricted** (tool-only collusion) | `post_message` is gone from planning round 1 onwards. |
-| `N > 0` | **Initial coordination only** | `post_message` works during planning rounds `1..N`, then disappears for planning rounds `> N`. |
 
 
 ### Where the toggle can be set

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -30,6 +31,75 @@ _STYLE = {
     "ytick.labelsize": 26,
     "legend.fontsize": 26,
 }
+
+# Cool/neutral colorblind-safe hues keep every sweep distinct from the
+# baseline's reserved orange. Squares are reserved for baseline references.
+_SERIES_COLORS = (
+    "#4c78a8",  # established steel blue
+    "#009e73",  # Okabe-Ito bluish green
+    "#7570b3",  # ColorBrewer violet
+    "#56b4e9",  # Okabe-Ito sky blue
+    "#666666",  # neutral graphite
+    "#332288",  # Tol deep indigo
+)
+_SERIES_MARKERS = ("o", "^", "D", "v", "P", "X", "<", ">", "h", "H")
+
+
+def _series_style(series_index: int) -> Tuple[str, str]:
+    i = int(series_index)
+    return (
+        _SERIES_COLORS[i % len(_SERIES_COLORS)],
+        _SERIES_MARKERS[i % len(_SERIES_MARKERS)],
+    )
+
+
+def _series_groups(
+    rows: List[Dict[str, Any]],
+) -> List[Tuple[int, str, List[Dict[str, Any]]]]:
+    """Return sweep series in index order, with a legacy single-series fallback."""
+    grouped: Dict[int, List[Dict[str, Any]]] = {}
+    labels: Dict[int, str] = {}
+    for row in rows:
+        raw_index = row.get("series_index")
+        try:
+            index = int(raw_index) if raw_index not in (None, "") else 0
+        except (TypeError, ValueError):
+            index = 0
+        grouped.setdefault(index, []).append(row)
+        label = str(row.get("series_label") or "").strip()
+        if label and index not in labels:
+            labels[index] = label
+    multi = len(grouped) > 1
+    return [
+        (
+            index,
+            labels.get(index) or ("Main sweep" if not multi else f"Series {index + 1}"),
+            grouped[index],
+        )
+        for index in sorted(grouped)
+    ]
+
+
+def _multi_legend(ax: Any, n_entries: int, *, fontsize: float = 12.0) -> None:
+    ax.legend(
+        loc="lower center",
+        bbox_to_anchor=(0.5, 1.01),
+        ncol=min(2, max(1, n_entries)),
+        fontsize=fontsize,
+        frameon=False,
+        handlelength=1.5,
+        columnspacing=1.2,
+        borderaxespad=0.2,
+    )
+
+
+def _series_offsets(n_series: int, has_baseline: bool) -> List[float]:
+    """Evenly fill the historical 0.56-wide group, baseline last."""
+    count = int(n_series) + int(bool(has_baseline))
+    if count <= 1:
+        return [0.0]
+    slot_width = 0.56 / count
+    return [(i - (count - 1) / 2.0) * slot_width for i in range(count)]
 
 
 def _add_violin(
@@ -117,134 +187,169 @@ def _plot_metric_by_x(
     if not xs:
         return
     numeric_x = _is_numeric(xs)
+    series = _series_groups(run_rows)
+    multi = len(series) > 1
+    has_baseline = bool(baseline_rows)
+    offsets = _series_offsets(len(series), has_baseline)
+    violin_width = min(0.28, 0.56 / len(offsets) * 0.78)
 
     fig, ax = plt.subplots(figsize=(6.5, 4.0))
     ax.grid(False)
-
     baseline_color = "#f58518"
     main_color = "#4c78a8"
 
-    if numeric_x:
-        by_x = groupby(run_rows, (x_key,))
-        x_vals = sorted(
-            [x for x in by_x.keys() if x[0] is not None], key=lambda t: float(t[0])
+    def _draw(
+        rows: List[Dict[str, Any]],
+        *,
+        pos: float,
+        error_pos: float,
+        color: str,
+        marker: str,
+        single: bool = False,
+    ) -> None:
+        ys = finite([r.get(y_key) for r in rows])
+        if not ys:
+            return
+        _add_violin(
+            ax,
+            pos=pos,
+            ys=ys,
+            color=color,
+            width=0.28 if single else violin_width,
         )
-        for x_t in x_vals:
-            x = x_t[0]
-            rows = by_x.get((x,), [])
-            ys = finite([r.get(y_key) for r in rows])
-            if not ys:
-                continue
-            _add_violin(ax, pos=float(x) - 0.11, ys=ys, color=main_color)
-            ax.errorbar(
-                [float(x)],
-                [mean(ys)],
-                yerr=[sem(ys)],
-                fmt="o",
-                ms=6,
-                color="black",
-                capsize=3,
-                zorder=5,
-            )
+        ax.errorbar(
+            [error_pos],
+            [mean(ys)],
+            yerr=[sem(ys)],
+            fmt=marker,
+            ms=5.5 if marker == "s" else 6,
+            color="black" if single and marker == "o" else color,
+            capsize=3,
+            zorder=6 if marker == "s" else 5,
+        )
 
+    if numeric_x:
+        rows_for_x = list(run_rows) + list(baseline_rows or []) if multi else run_rows
+        by_x_all = groupby(rows_for_x, (x_key,))
+        x_vals = sorted(
+            [x for x in by_x_all if x[0] is not None], key=lambda t: float(t[0])
+        )
+        if not multi:
+            by_x = groupby(run_rows, (x_key,))
+            for x_t in x_vals:
+                x = x_t[0]
+                _draw(
+                    by_x.get((x,), []),
+                    pos=float(x) - 0.11,
+                    error_pos=float(x),
+                    color=main_color,
+                    marker="o",
+                    single=True,
+                )
+        else:
+            for series_i, (index, _, series_rows) in enumerate(series):
+                color, marker = _series_style(index)
+                by_x = groupby(series_rows, (x_key,))
+                for x_t in x_vals:
+                    x = x_t[0]
+                    pos = float(x) + offsets[series_i]
+                    _draw(
+                        by_x.get((x,), []),
+                        pos=pos,
+                        error_pos=pos,
+                        color=color,
+                        marker=marker,
+                    )
         if baseline_rows:
             by_x_base = groupby(baseline_rows, (x_key,))
-            x_vals_base = sorted(
-                [x for x in by_x_base.keys() if x[0] is not None],
-                key=lambda t: float(t[0]),
-            )
-            for x_t in x_vals_base:
+            offset = offsets[-1] if multi else 0.11
+            base_x_vals = [x for x in by_x_base if x[0] is not None]
+            for x_t in sorted(base_x_vals, key=lambda t: float(t[0])):
                 x = x_t[0]
-                rows = by_x_base.get((x,), [])
-                ys = finite([r.get(y_key) for r in rows])
-                if not ys:
-                    continue
-                _add_violin(ax, pos=float(x) + 0.11, ys=ys, color=baseline_color)
-                ax.errorbar(
-                    [float(x)],
-                    [mean(ys)],
-                    yerr=[sem(ys)],
-                    fmt="s",
-                    ms=5.5,
+                pos = float(x) + offset
+                _draw(
+                    by_x_base[(x,)],
+                    pos=pos,
+                    error_pos=pos if multi else float(x),
                     color=baseline_color,
-                    capsize=3,
-                    zorder=6,
+                    marker="s",
+                    single=not multi,
                 )
-            ax.scatter(
-                [], [], s=28, color=baseline_color, label=baseline_label, marker="s"
-            )
-            ax.scatter([], [], s=28, color=main_color, label="Main sweep", marker="o")
-            ax.legend(loc="best")
-
         ax.set_xlabel(x_label)
         ax.set_ylabel(y_label)
     else:
         cats = [str(v) for v in _unique_non_null(run_rows, x_key)]
         if not cats:
             return
-        by_x = groupby(run_rows, (x_key,))
-        for i, c in enumerate(cats):
-            ys = finite([r.get(y_key) for r in by_x.get((c,), [])])
-            if not ys:
-                continue
-            _add_violin(ax, pos=float(i) - 0.11, ys=ys, color=main_color)
-            ax.errorbar(
-                [float(i)],
-                [mean(ys)],
-                yerr=[sem(ys)],
-                fmt="o",
-                ms=6,
-                color="black",
-                capsize=3,
-                zorder=5,
-            )
-
+        if not multi:
+            by_x = groupby(run_rows, (x_key,))
+            for i, category in enumerate(cats):
+                _draw(
+                    by_x.get((category,), []),
+                    pos=float(i) - 0.11,
+                    error_pos=float(i),
+                    color=main_color,
+                    marker="o",
+                    single=True,
+                )
+        else:
+            for series_i, (index, _, series_rows) in enumerate(series):
+                color, marker = _series_style(index)
+                by_x = groupby(series_rows, (x_key,))
+                for i, category in enumerate(cats):
+                    pos = float(i) + offsets[series_i]
+                    _draw(
+                        by_x.get((category,), []),
+                        pos=pos,
+                        error_pos=pos,
+                        color=color,
+                        marker=marker,
+                    )
         if baseline_rows:
-            # If the benign/baseline sweep didn't enumerate the same categorical axis
-            # (e.g., it only has target_role="departmental" with adversary_count=0),
-            # treat it as a baseline for *all* categories in the main sweep.
             baseline_rows_for_plot = baseline_rows
             base_cats = [str(v) for v in _unique_non_null(baseline_rows, x_key)]
             if len(base_cats) == 1 and len(cats) > 1:
                 baseline_rows_for_plot = []
-                for c in cats:
-                    for r in baseline_rows:
-                        rr = dict(r)
-                        rr[x_key] = c
-                        baseline_rows_for_plot.append(rr)
-
+                for category in cats:
+                    for row in baseline_rows:
+                        patched = dict(row)
+                        patched[x_key] = category
+                        baseline_rows_for_plot.append(patched)
             by_x_base = groupby(baseline_rows_for_plot, (x_key,))
-            for i, c in enumerate(cats):
-                rows = by_x_base.get((c,), [])
-                if not rows:
-                    continue
-                ys = finite([r.get(y_key) for r in rows])
-                if not ys:
-                    continue
-                _add_violin(ax, pos=float(i) + 0.11, ys=ys, color=baseline_color)
-                ax.errorbar(
-                    [float(i)],
-                    [mean(ys)],
-                    yerr=[sem(ys)],
-                    fmt="s",
-                    ms=5.5,
+            offset = offsets[-1] if multi else 0.11
+            for i, category in enumerate(cats):
+                pos = float(i) + offset
+                _draw(
+                    by_x_base.get((category,), []),
+                    pos=pos,
+                    error_pos=pos if multi else float(i),
                     color=baseline_color,
-                    capsize=3,
-                    zorder=6,
+                    marker="s",
+                    single=not multi,
                 )
-            ax.scatter(
-                [], [], s=28, color=baseline_color, label=baseline_label, marker="s"
-            )
-            ax.scatter([], [], s=28, color=main_color, label="Main sweep", marker="o")
-            ax.legend(loc="best")
-
         ax.set_xticks(range(len(cats)))
         rot = 0 if max((len(c) for c in cats), default=0) <= 12 else 90
         ax.set_xticklabels(cats, rotation=rot, ha="right" if rot else "center")
         ax.set_xlabel(x_label)
         ax.set_ylabel(y_label)
 
-    fig.tight_layout()
+    if multi:
+        for index, label, _ in series:
+            color, marker = _series_style(index)
+            ax.scatter([], [], s=36, color=color, label=label, marker=marker)
+    if baseline_rows:
+        ax.scatter([], [], s=28, color=baseline_color, label=baseline_label, marker="s")
+        if not multi:
+            ax.scatter([], [], s=28, color=main_color, label="Main sweep", marker="o")
+    if multi:
+        _multi_legend(ax, len(series) + int(has_baseline))
+    elif baseline_rows:
+        ax.legend(loc="best")
+
+    if multi and not numeric_x:
+        fig.subplots_adjust(left=0.16, right=0.98, bottom=0.30, top=0.70)
+    else:
+        fig.tight_layout()
     fig.savefig(out_path, format="pdf", bbox_inches="tight")
     log_saved_plot(out_path, logger=logger)
     plt.close(fig)
@@ -254,7 +359,6 @@ def _plot_metric_by_x(
 
     csv_path = out_path.with_suffix(".csv")
     script_path = out_path.with_name(out_path.stem + "__replot.py")
-
     baseline_expanded = False
     baseline_rows_for_plot = baseline_rows
     if not numeric_x and baseline_rows:
@@ -263,22 +367,33 @@ def _plot_metric_by_x(
         if len(base_cats) == 1 and len(cats) > 1:
             baseline_expanded = True
             baseline_rows_for_plot = []
-            for c in cats:
-                for r in baseline_rows:
-                    rr = dict(r)
-                    rr[x_key] = c
-                    baseline_rows_for_plot.append(rr)
+            for category in cats:
+                for row in baseline_rows:
+                    patched = dict(row)
+                    patched[x_key] = category
+                    baseline_rows_for_plot.append(patched)
+
+    series_by_identity = {
+        id(row): (index, label)
+        for index, label, series_rows in series
+        for row in series_rows
+    }
+    series_catalog = json.dumps([[index, label] for index, label, _ in series])
 
     def _point_rows(rows: List[Dict[str, Any]], *, group: str) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
-        for r in rows:
-            x = r.get(x_key)
-            y = r.get(y_key)
+        for row in rows:
+            x = row.get(x_key)
+            y = row.get(y_key)
             if x is None or y is None:
                 continue
+            index, label = series_by_identity.get(id(row), (0, "Main sweep"))
             out.append(
                 {
                     "group": group,
+                    "series_index": index if group == "main" else "",
+                    "series_label": label if group == "main" else baseline_label,
+                    "plot_series_json": series_catalog,
                     "plot_x_key": x_key,
                     "plot_y_key": y_key,
                     "plot_x_label": x_label,
@@ -289,205 +404,180 @@ def _plot_metric_by_x(
                     else False,
                     x_key: x,
                     y_key: y,
-                    "run_id": r.get("run_id"),
-                    "seed": r.get("seed"),
-                    "target_role": r.get("target_role"),
-                    "adversary_count": r.get("adversary_count"),
-                    "num_agents": r.get("num_agents"),
+                    "run_id": row.get("run_id"),
+                    "seed": row.get("seed"),
+                    "target_role": row.get("target_role"),
+                    "adversary_count": row.get("adversary_count"),
+                    "num_agents": row.get("num_agents"),
                 }
             )
         return out
 
-    rows_out: List[Dict[str, Any]] = []
-    rows_out.extend(_point_rows(run_rows, group="main"))
+    rows_out = _point_rows(run_rows, group="main")
     if baseline_rows_for_plot:
-        rows_out.extend(_point_rows(list(baseline_rows_for_plot), group="baseline"))
+        rows_out += _point_rows(list(baseline_rows_for_plot), group="baseline")
     write_csv(csv_path, rows_out)
 
     script = f"""\
 from __future__ import annotations
-
 import csv
+import json
 import math
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-
+from typing import Any, Dict, List, Optional, Tuple
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+_COLORS = ("#4c78a8", "#009e73", "#7570b3", "#56b4e9", "#666666", "#332288")
+_MARKERS = ("o", "^", "D", "v", "P", "X", "<", ">", "h", "H")
 
-def _as_float(x: Any) -> Optional[float]:
-    if x is None:
-        return None
+def _float(x: Any) -> Optional[float]:
     try:
         return float(x)
     except Exception:
         return None
 
+def _finite(xs: List[Any]) -> List[float]:
+    return [f for f in (_float(x) for x in xs) if f is not None and math.isfinite(f)]
 
-def _mean(xs: List[float]) -> Optional[float]:
-    if not xs:
-        return None
+def _mean(xs: List[float]) -> float:
     return float(sum(xs) / len(xs))
-
 
 def _sem(xs: List[float]) -> float:
     if len(xs) <= 1:
         return 0.0
-    m = float(sum(xs) / len(xs))
-    var = sum((x - m) ** 2 for x in xs) / float(len(xs) - 1)
-    return float(math.sqrt(var) / math.sqrt(len(xs)))
-
-
-def _finite(xs: List[Any]) -> List[float]:
-    out: List[float] = []
-    for x in xs:
-        f = _as_float(x)
-        if f is None:
-            continue
-        if math.isfinite(f):
-            out.append(float(f))
-    return out
-
-
-def _is_numeric(values: List[Any]) -> bool:
-    for v in values:
-        if v is None:
-            continue
-        try:
-            float(v)
-        except Exception:
-            return False
-    return True
-
+    m = _mean(xs)
+    return math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1)) / math.sqrt(len(xs))
 
 def _group(rows: List[Dict[str, Any]], key: str) -> Dict[Any, List[Dict[str, Any]]]:
     out: Dict[Any, List[Dict[str, Any]]] = {{}}
-    for r in rows:
-        out.setdefault(r.get(key), []).append(r)
+    for row in rows:
+        out.setdefault(row.get(key), []).append(row)
     return out
 
+def _series(rows: List[Dict[str, Any]]) -> List[Tuple[int, str, List[Dict[str, Any]]]]:
+    grouped: Dict[int, List[Dict[str, Any]]] = {{}}
+    labels: Dict[int, str] = {{}}
+    for row in rows:
+        try:
+            index = int(row.get("series_index") or 0)
+        except Exception:
+            index = 0
+        grouped.setdefault(index, []).append(row)
+        label = str(row.get("series_label") or "").strip()
+        if label:
+            labels.setdefault(index, label)
+    multi = len(grouped) > 1
+    return [(i, labels.get(i) or ("Main sweep" if not multi else f"Series {{i + 1}}"), grouped[i]) for i in sorted(grouped)]
+
+def _numeric(values: List[Any]) -> bool:
+    for value in values:
+        if value is not None and _float(value) is None:
+            return False
+    return True
 
 def main() -> None:
     here = Path(__file__).resolve().parent
-    csv_path = here / {csv_path.name!r}
-
-    rows: List[Dict[str, Any]] = []
-    with csv_path.open("r", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
-        for r in reader:
-            rows.append(dict(r))
-
+    with (here / {csv_path.name!r}).open("r", encoding="utf-8", newline="") as f:
+        rows = [dict(r) for r in csv.DictReader(f)]
     if not rows:
         raise SystemExit("No rows in CSV")
-
     x_key = rows[0].get("plot_x_key") or {x_key!r}
     y_key = rows[0].get("plot_y_key") or {y_key!r}
     x_label = rows[0].get("plot_x_label") or {x_label!r}
     y_label = rows[0].get("plot_y_label") or {y_label!r}
-
-    main_rows = [r for r in rows if (r.get("group") or "") == "main"]
-    base_rows = [r for r in rows if (r.get("group") or "") == "baseline"]
-
-    numeric_x = _is_numeric([r.get(x_key) for r in main_rows])
-
+    main_rows = [r for r in rows if r.get("group") == "main"]
+    base_rows = [r for r in rows if r.get("group") == "baseline"]
+    series = _series(main_rows)
+    catalog = json.loads(rows[0].get("plot_series_json") or "[]")
+    if len(catalog) > 1:
+        present = {{index: selected for index, _, selected in series}}
+        series = [(int(index), str(label), present.get(int(index), [])) for index, label in catalog]
+    multi = len(series) > 1
+    count = len(series) + int(bool(base_rows))
+    offsets = [(i - (count - 1) / 2) * 0.56 / count for i in range(count)]
+    width = min(0.28, 0.56 / count * 0.78)
     fig, ax = plt.subplots(figsize=(6.5, 4.0))
     ax.grid(False)
 
-    baseline_color = "#f58518"
-    main_color = "#4c78a8"
-
-    def _violin(pos: float, vals: List[float], color: str, alpha: float = 0.35) -> None:
+    def draw(selected: List[Dict[str, Any]], pos: float, error_pos: float, color: str, marker: str, single: bool = False) -> None:
+        vals = _finite([r.get(y_key) for r in selected])
         if not vals:
             return
-        parts = ax.violinplot(
-            [vals],
-            positions=[pos],
-            widths=0.28,
-            showmeans=False,
-            showmedians=True,
-            showextrema=False,
-        )
-        for b in parts.get("bodies", []):
-            b.set_facecolor(color)
-            b.set_edgecolor(color)
-            b.set_alpha(alpha)
+        parts = ax.violinplot([vals], positions=[pos], widths=0.28 if single else width, showmeans=False, showmedians=True, showextrema=False)
+        for body in parts.get("bodies", []):
+            body.set_facecolor(color)
+            body.set_edgecolor(color)
+            body.set_alpha(0.35)
         if parts.get("cmedians") is not None:
             parts["cmedians"].set_color(color)
             parts["cmedians"].set_linewidth(1.6)
+        ax.errorbar([error_pos], [_mean(vals)], yerr=[_sem(vals)], fmt=marker, ms=5.5 if marker == "s" else 6, color="black" if single and marker == "o" else color, capsize=3, zorder=6 if marker == "s" else 5)
 
+    numeric_x = _numeric([r.get(x_key) for r in main_rows])
     if numeric_x:
-        by_x = _group(main_rows, x_key)
-        x_vals = sorted([x for x in by_x.keys() if x is not None], key=lambda t: float(t))
-        for x in x_vals:
-            ys = _finite([r.get(y_key) for r in by_x.get(x, [])])
-            if not ys:
-                continue
-            _violin(float(x) - 0.11, ys, main_color)
-            ax.errorbar([float(x)], [_mean(ys)], yerr=[_sem(ys)], fmt="o", ms=6, color="black", capsize=3, zorder=5)
-
+        source = main_rows + base_rows if multi else main_rows
+        x_vals = sorted(_group(source, x_key), key=lambda x: float(x))
+        if not multi:
+            grouped = _group(main_rows, x_key)
+            for x in x_vals:
+                draw(grouped[x], float(x) - 0.11, float(x), "#4c78a8", "o", True)
+        else:
+            for si, (index, _, selected) in enumerate(series):
+                grouped = _group(selected, x_key)
+                color, marker = _COLORS[index % len(_COLORS)], _MARKERS[index % len(_MARKERS)]
+                for x in x_vals:
+                    pos = float(x) + offsets[si]
+                    draw(grouped.get(x, []), pos, pos, color, marker)
         if base_rows:
-            by_xb = _group(base_rows, x_key)
-            xb_vals = sorted([x for x in by_xb.keys() if x is not None], key=lambda t: float(t))
-            for x in xb_vals:
-                ys = _finite([r.get(y_key) for r in by_xb.get(x, [])])
-                if not ys:
-                    continue
-                _violin(float(x) + 0.11, ys, baseline_color)
-                ax.errorbar([float(x)], [_mean(ys)], yerr=[_sem(ys)], fmt="s", ms=5.5, color=baseline_color, capsize=3, zorder=6)
-            ax.scatter([], [], s=28, color=baseline_color, label=rows[0].get("baseline_label") or "Benign baseline", marker="s")
-            ax.scatter([], [], s=28, color=main_color, label="Main sweep", marker="o")
-            ax.legend(loc="best")
-
-        ax.set_xlabel(str(x_label))
-        ax.set_ylabel(str(y_label))
+            grouped = _group(base_rows, x_key)
+            offset = offsets[-1] if multi else 0.11
+            for x in sorted(grouped, key=float):
+                pos = float(x) + offset
+                draw(grouped[x], pos, pos if multi else float(x), "#f58518", "s", not multi)
     else:
-        cats: List[str] = []
-        seen = set()
-        for r in main_rows:
-            c = str(r.get(x_key))
-            if c in seen:
-                continue
-            seen.add(c)
-            cats.append(c)
-        if not cats:
-            raise SystemExit("No categories")
-
-        by_c = _group(main_rows, x_key)
-        for i, c in enumerate(cats):
-            ys = _finite([r.get(y_key) for r in by_c.get(c, [])])
-            if not ys:
-                continue
-            _violin(float(i) - 0.11, ys, main_color)
-            ax.errorbar([float(i)], [_mean(ys)], yerr=[_sem(ys)], fmt="o", ms=6, color="black", capsize=3, zorder=5)
-
+        cats = list(dict.fromkeys(str(r.get(x_key)) for r in main_rows))
+        if not multi:
+            grouped = _group(main_rows, x_key)
+            for i, category in enumerate(cats):
+                draw(grouped.get(category, []), i - 0.11, i, "#4c78a8", "o", True)
+        else:
+            for si, (index, _, selected) in enumerate(series):
+                grouped = _group(selected, x_key)
+                color, marker = _COLORS[index % len(_COLORS)], _MARKERS[index % len(_MARKERS)]
+                for i, category in enumerate(cats):
+                    pos = i + offsets[si]
+                    draw(grouped.get(category, []), pos, pos, color, marker)
         if base_rows:
-            by_cb = _group(base_rows, x_key)
-            for i, c in enumerate(cats):
-                ys = _finite([r.get(y_key) for r in by_cb.get(c, [])])
-                if not ys:
-                    continue
-                _violin(float(i) + 0.11, ys, baseline_color)
-                ax.errorbar([float(i)], [_mean(ys)], yerr=[_sem(ys)], fmt="s", ms=5.5, color=baseline_color, capsize=3, zorder=6)
-            ax.scatter([], [], s=28, color=baseline_color, label=rows[0].get("baseline_label") or "Benign baseline", marker="s")
-            ax.scatter([], [], s=28, color=main_color, label="Main sweep", marker="o")
-            ax.legend(loc="best")
-
-        ax.set_xticks(list(range(len(cats))))
-        ax.set_xticklabels(
-            cats,
-            rotation=0 if max((len(c) for c in cats), default=0) <= 12 else 90,
-            ha="right",
-        )
-        ax.set_xlabel(str(x_label))
-        ax.set_ylabel(str(y_label))
-
-    fig.tight_layout()
-    out_pdf = here / {out_path.name!r}
-    fig.savefig(out_pdf, format="pdf", bbox_inches="tight")
+            grouped = _group(base_rows, x_key)
+            offset = offsets[-1] if multi else 0.11
+            for i, category in enumerate(cats):
+                pos = i + offset
+                draw(grouped.get(category, []), pos, pos if multi else float(i), "#f58518", "s", not multi)
+        rot = 0 if max(map(len, cats), default=0) <= 12 else 90
+        ax.set_xticks(range(len(cats)))
+        ax.set_xticklabels(cats, rotation=rot, ha="right" if rot else "center")
+    ax.set_xlabel(str(x_label))
+    ax.set_ylabel(str(y_label))
+    if multi:
+        for index, label, _ in series:
+            ax.scatter([], [], s=36, color=_COLORS[index % len(_COLORS)], marker=_MARKERS[index % len(_MARKERS)], label=label)
+    if base_rows:
+        label = base_rows[0].get("series_label") or base_rows[0].get("baseline_label") or "Benign baseline"
+        ax.scatter([], [], s=28, color="#f58518", marker="s", label=label)
+        if not multi:
+            ax.scatter([], [], s=28, color="#4c78a8", marker="o", label="Main sweep")
+    if multi:
+        ax.legend(loc="lower center", bbox_to_anchor=(0.5, 1.01), ncol=min(2, len(series) + int(bool(base_rows))), fontsize=12, frameon=False, handlelength=1.5, columnspacing=1.2, borderaxespad=0.2)
+    elif base_rows:
+        ax.legend(loc="best")
+    if multi and not numeric_x:
+        fig.subplots_adjust(left=0.16, right=0.98, bottom=0.30, top=0.70)
+    else:
+        fig.tight_layout()
+    fig.savefig(here / {out_path.name!r}, format="pdf", bbox_inches="tight")
     plt.close(fig)
-
 
 if __name__ == "__main__":
     main()
@@ -501,11 +591,7 @@ def plot_distance_effects(
     out_path: Path,
     emit_artifacts: bool = True,
 ) -> None:
-    """
-    Aggregates non-adversary agents across runs and plots:
-      - suspicion rate by distance to nearest adversary
-      - correct attribution rate by distance to nearest adversary
-    """
+    """Plot non-adversary suspicion and attribution by adversary distance."""
     apply_default_style(plt)
     plt.rcParams.update(_STYLE)
     ensure_dir(out_path.parent)
@@ -518,53 +604,177 @@ def plot_distance_effects(
     ]
     if not rows:
         return
+    series = _series_groups(rows)
+    multi = len(series) > 1
 
-    by_d = groupby(rows, ("distance_to_nearest_adversary",))
-    ds = sorted([int(k[0]) for k in by_d.keys() if k[0] is not None])
-    if not ds:
-        return
-
-    susp_rates: List[float] = []
-    corr_rates: List[float] = []
-    for d in ds:
-        bucket = by_d.get((d,), [])
-        denom = len(bucket)
-        if denom <= 0:
-            susp_rates.append(0.0)
-            corr_rates.append(0.0)
-            continue
-        susp = sum(1 for r in bucket if bool(r.get("suspects_foul_play")))
-        corr = sum(1 for r in bucket if bool(r.get("correctly_blames_adversary")))
-        susp_rates.append(susp / denom)
-        corr_rates.append(corr / denom)
+    def _rates(
+        selected: List[Dict[str, Any]],
+    ) -> Tuple[List[int], List[float], List[float]]:
+        by_d = groupby(selected, ("distance_to_nearest_adversary",))
+        ds = sorted(int(k[0]) for k in by_d if k[0] is not None)
+        susp_rates: List[float] = []
+        corr_rates: List[float] = []
+        for distance in ds:
+            bucket = by_d.get((distance,), [])
+            denom = len(bucket)
+            susp = sum(1 for r in bucket if bool(r.get("suspects_foul_play")))
+            corr = sum(1 for r in bucket if bool(r.get("correctly_blames_adversary")))
+            susp_rates.append(susp / denom if denom else 0.0)
+            corr_rates.append(corr / denom if denom else 0.0)
+        return ds, susp_rates, corr_rates
 
     fig, ax = plt.subplots(figsize=(6.5, 4.0))
     ax.grid(False)
-    ax.plot(
-        ds,
-        susp_rates,
-        marker="o",
-        linewidth=3.0,
-        markersize=8,
-        label="Suspicion rate (non-adversary)",
-    )
-    ax.plot(
-        ds,
-        corr_rates,
-        marker="o",
-        linewidth=3.0,
-        markersize=8,
-        label="Correct attribution rate (non-adversary)",
-    )
+    if not multi:
+        ds, susp_rates, corr_rates = _rates(rows)
+        if not ds:
+            return
+        ax.plot(
+            ds,
+            susp_rates,
+            marker="o",
+            linewidth=3.0,
+            markersize=8,
+            label="Suspicion rate (non-adversary)",
+        )
+        ax.plot(
+            ds,
+            corr_rates,
+            marker="o",
+            linewidth=3.0,
+            markersize=8,
+            label="Correct attribution rate (non-adversary)",
+        )
+        ax.legend(loc="best")
+    else:
+        for index, label, selected in series:
+            ds, susp_rates, corr_rates = _rates(selected)
+            color, marker = _series_style(index)
+            ax.plot(
+                ds,
+                susp_rates,
+                marker=marker,
+                color=color,
+                linewidth=2.4,
+                markersize=7,
+                linestyle="-",
+                label=f"{label} — suspicion",
+            )
+            ax.plot(
+                ds,
+                corr_rates,
+                marker=marker,
+                color=color,
+                linewidth=2.4,
+                markersize=7,
+                linestyle="--",
+                label=f"{label} — correct attribution",
+            )
+        _multi_legend(ax, 2 * len(series), fontsize=10.5)
     ax.set_xlabel("Distance to Nearest Adversary")
     ax.set_ylabel("Rate")
     ax.set_ylim(0.0, 1.05)
-    ax.legend(loc="best")
-
     fig.tight_layout()
     fig.savefig(out_path, format="pdf", bbox_inches="tight")
     log_saved_plot(out_path, logger=logger)
     plt.close(fig)
+
+    if not emit_artifacts:
+        return
+    csv_path = out_path.with_suffix(".csv")
+    script_path = out_path.with_name(out_path.stem + "__replot.py")
+    artifact_rows: List[Dict[str, Any]] = []
+    for index, label, selected in series:
+        for row in selected:
+            artifact_rows.append(
+                {
+                    "group": "main",
+                    "series_index": index,
+                    "series_label": label,
+                    "distance_to_nearest_adversary": row.get(
+                        "distance_to_nearest_adversary"
+                    ),
+                    "suspects_foul_play": bool(row.get("suspects_foul_play")),
+                    "correctly_blames_adversary": bool(
+                        row.get("correctly_blames_adversary")
+                    ),
+                    "run_id": row.get("run_id"),
+                    "seed": row.get("seed"),
+                }
+            )
+    write_csv(csv_path, artifact_rows)
+    script = f"""\
+from __future__ import annotations
+import csv
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+_COLORS = ("#4c78a8", "#009e73", "#7570b3", "#56b4e9", "#666666", "#332288")
+_MARKERS = ("o", "^", "D", "v", "P", "X", "<", ">", "h", "H")
+
+def _series(rows: List[Dict[str, Any]]) -> List[Tuple[int, str, List[Dict[str, Any]]]]:
+    grouped: Dict[int, List[Dict[str, Any]]] = {{}}
+    labels: Dict[int, str] = {{}}
+    for row in rows:
+        try:
+            index = int(row.get("series_index") or 0)
+        except Exception:
+            index = 0
+        grouped.setdefault(index, []).append(row)
+        label = str(row.get("series_label") or "").strip()
+        if label:
+            labels.setdefault(index, label)
+    multi = len(grouped) > 1
+    return [(i, labels.get(i) or ("Main sweep" if not multi else f"Series {{i + 1}}"), grouped[i]) for i in sorted(grouped)]
+
+def _bool(value: Any) -> bool:
+    return str(value).strip().lower() in ("1", "true", "yes")
+
+def _rates(rows: List[Dict[str, Any]]) -> Tuple[List[int], List[float], List[float]]:
+    grouped: Dict[int, List[Dict[str, Any]]] = {{}}
+    for row in rows:
+        grouped.setdefault(int(float(row["distance_to_nearest_adversary"])), []).append(row)
+    ds = sorted(grouped)
+    susp = [sum(_bool(r.get("suspects_foul_play")) for r in grouped[d]) / len(grouped[d]) for d in ds]
+    corr = [sum(_bool(r.get("correctly_blames_adversary")) for r in grouped[d]) / len(grouped[d]) for d in ds]
+    return ds, susp, corr
+
+def main() -> None:
+    here = Path(__file__).resolve().parent
+    with (here / {csv_path.name!r}).open("r", encoding="utf-8", newline="") as f:
+        rows = [dict(r) for r in csv.DictReader(f)]
+    if not rows:
+        raise SystemExit("No rows in CSV")
+    series = _series(rows)
+    multi = len(series) > 1
+    fig, ax = plt.subplots(figsize=(6.5, 4.0))
+    ax.grid(False)
+    if not multi:
+        ds, susp, corr = _rates(rows)
+        ax.plot(ds, susp, marker="o", linewidth=3.0, markersize=8, label="Suspicion rate (non-adversary)")
+        ax.plot(ds, corr, marker="o", linewidth=3.0, markersize=8, label="Correct attribution rate (non-adversary)")
+        ax.legend(loc="best")
+    else:
+        for index, label, selected in series:
+            ds, susp, corr = _rates(selected)
+            color, marker = _COLORS[index % len(_COLORS)], _MARKERS[index % len(_MARKERS)]
+            ax.plot(ds, susp, marker=marker, color=color, linewidth=2.4, markersize=7, linestyle="-", label=f"{{label}} — suspicion")
+            ax.plot(ds, corr, marker=marker, color=color, linewidth=2.4, markersize=7, linestyle="--", label=f"{{label}} — correct attribution")
+        ax.legend(loc="lower center", bbox_to_anchor=(0.5, 1.01), ncol=2, fontsize=10.5, frameon=False, handlelength=1.5, columnspacing=1.2, borderaxespad=0.2)
+    ax.set_xlabel("Distance to Nearest Adversary")
+    ax.set_ylabel("Rate")
+    ax.set_ylim(0.0, 1.05)
+    fig.tight_layout()
+    fig.savefig(here / {out_path.name!r}, format="pdf", bbox_inches="tight")
+    plt.close(fig)
+
+if __name__ == "__main__":
+    main()
+"""
+    script_path.write_text(script, encoding="utf-8")
 
 
 def plot_sweep_metrics(
